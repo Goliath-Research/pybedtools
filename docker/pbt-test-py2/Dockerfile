@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN echo 'export PATH=/opt/conda/bin:$PATH' > /etc/profile.d/conda.sh && \
     wget --quiet https://repo.continuum.io/miniconda/Miniconda-3.10.1-Linux-x86_64.sh && \
+    echo "363f56f5608d1552325549e7371fcf460c5ed45484eb300058e3b99c997808b5  Miniconda-3.10.1-Linux-x86_64.sh" | sha256sum --check --strict - && \
     /bin/bash /Miniconda-3.10.1-Linux-x86_64.sh -b -p /opt/conda && \
     rm Miniconda-3.10.1-Linux-x86_64.sh && \
     /opt/conda/bin/conda install --yes conda==3.14.1
