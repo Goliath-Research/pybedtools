@@ -24,6 +24,10 @@ from .cbedtools import create_interval_from_list
 
 BUFSIZE = -1
 
+# UCSC assembly names are also MySQL database names, so they must never contain
+# anything beyond ASCII letters, digits, and underscores.
+_ASSEMBLY_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+
 _tags = {}
 
 
@@ -723,6 +727,11 @@ def get_chromsizes_from_ucsc(
     host_url : str
         URL of UCSC mirror MySQL server.
     """
+    if not isinstance(genome, str) or not _ASSEMBLY_NAME_RE.fullmatch(genome):
+        raise ValueError(
+            "Invalid assembly name %r: only ASCII letters, digits, and "
+            "underscores are allowed" % (genome,)
+        )
     if not internet_on(timeout=timeout):
         raise ValueError(
             "It appears you don't have an internet connection "
@@ -734,7 +743,7 @@ def get_chromsizes_from_ucsc(
         "--host=" + host_url,
         "-A",
         "-e",
-        "select chrom, size from %s.chromInfo" % genome,
+        "select chrom, size from `%s`.chromInfo" % genome,
     ]
     failures = []
     d = {}
