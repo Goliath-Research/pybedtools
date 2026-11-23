@@ -65,6 +65,21 @@ gzstreambuf* gzstreambuf::open( const char* name, int open_mode) {
     return this;
 }
 
+gzstreambuf* gzstreambuf::open_fd( int fd, int open_mode) {
+    if ( is_open())
+        return (gzstreambuf*)0;
+    mode = open_mode;
+    // read-only
+    if ( ! (mode & std::ios::in) || (mode & std::ios::out)
+        || (mode & std::ios::ate) || (mode & std::ios::app))
+        return (gzstreambuf*)0;
+    file = gzdopen( fd, "rb");
+    if (file == 0)
+        return (gzstreambuf*)0;
+    opened = 1;
+    return this;
+}
+
 gzstreambuf * gzstreambuf::close() {
     if ( is_open()) {
         sync();
@@ -79,7 +94,7 @@ int gzstreambuf::underflow() { // used for input buffer only
     if ( gptr() && ( gptr() < egptr()))
         return * reinterpret_cast<unsigned char *>( gptr());
 
-    if ( ! (mode & std::ios::in) || ! opened)
+    if ( ! (mode & std::ios::in) || ! opened || limit_hit)
         return EOF;
     // Josuttis' implementation of inbuf
     int n_putback = gptr() - eback();
@@ -90,6 +105,16 @@ int gzstreambuf::underflow() { // used for input buffer only
     int num = gzread( file, buffer+4, bufferSize-4);
     if (num <= 0) // ERROR or EOF
         return EOF;
+
+    total_out += num;
+    if ( max_decompressed >= 0 && total_out > max_decompressed) {
+        limit_hit = GZ_LIMIT_DECOMPRESSED;
+        return EOF;
+    }
+    if ( max_compressed >= 0 && (long long) gzoffset( file) > max_compressed) {
+        limit_hit = GZ_LIMIT_COMPRESSED;
+        return EOF;
+    }
 
     // reset buffer pointers
     setg( buffer + (4 - n_putback),   // beginning of putback area
@@ -148,6 +173,11 @@ gzstreambase::~gzstreambase() {
 
 void gzstreambase::open( const char* name, int open_mode) {
     if ( ! buf.open( name, open_mode))
+        clear( rdstate() | std::ios::badbit);
+}
+
+void gzstreambase::open_fd( int fd, int open_mode) {
+    if ( ! buf.open_fd( fd, open_mode))
         clear( rdstate() | std::ios::badbit);
 }
 

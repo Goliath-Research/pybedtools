@@ -51,10 +51,17 @@ private:
     char             buffer[bufferSize]; // data buffer
     char             opened;             // open/close state of stream
     int              mode;               // I/O mode
+    long long        max_compressed;     // negative means no ceiling
+    long long        max_decompressed;   // negative means no ceiling
+    long long        total_out;          // decompressed bytes read so far
+    int              limit_hit;          // one of the GZ_LIMIT_* values
 
     int flush_buffer();
 public:
-    gzstreambuf() : opened(0) {
+    enum { GZ_LIMIT_NONE = 0, GZ_LIMIT_COMPRESSED = 1, GZ_LIMIT_DECOMPRESSED = 2 };
+
+    gzstreambuf() : opened(0), max_compressed(-1), max_decompressed(-1),
+                    total_out(0), limit_hit(GZ_LIMIT_NONE) {
         setp( buffer, buffer + (bufferSize-1));
         setg( buffer + 4,     // beginning of putback area
               buffer + 4,     // read position
@@ -63,6 +70,15 @@ public:
     }
     int is_open() { return opened; }
     gzstreambuf* open( const char* name, int open_mode);
+    // Read from an already-open descriptor; takes ownership of fd on success.
+    gzstreambuf* open_fd( int fd, int open_mode);
+    // Once reading goes past a ceiling, the stream reports EOF and
+    // limit_exceeded() says which ceiling was hit.
+    void set_limits( long long compressed, long long decompressed) {
+        max_compressed = compressed;
+        max_decompressed = decompressed;
+    }
+    int limit_exceeded() { return limit_hit; }
     gzstreambuf* close();
     ~gzstreambuf() { close(); }
     
@@ -79,6 +95,7 @@ public:
     gzstreambase( const char* name, int open_mode);
     ~gzstreambase();
     void open( const char* name, int open_mode);
+    void open_fd( int fd, int open_mode);
     void close();
     gzstreambuf* rdbuf() { return &buf; }
 };
@@ -97,6 +114,9 @@ public:
     gzstreambuf* rdbuf() { return gzstreambase::rdbuf(); }
     void open( const char* name, int open_mode = std::ios::in) {
         gzstreambase::open( name, open_mode);
+    }
+    void open_fd( int fd, int open_mode = std::ios::in) {
+        gzstreambase::open_fd( fd, open_mode);
     }
 };
 

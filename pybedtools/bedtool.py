@@ -27,6 +27,7 @@ from .helpers import (
     isBAM,
     isBGZIP,
     isGZIP,
+    open_interval_file,
     BEDToolsError,
     pybedtoolsError,
     _call_randomintersect,
@@ -1186,14 +1187,19 @@ class BedTool(object):
             # here
             return BAM(self.fn)
 
+        return self._iter_intervals()
+
+    def _iter_intervals(self, preload: bool = False):
+        """
+        Iterator over the features of a non-BAM BedTool. With *preload*, a
+        gzip file is decompressed completely (see
+        :func:`pybedtools.helpers.open_interval_file`) before returning.
+        """
         # Plain ol' filename
         if isinstance(self.fn, str):
             if not os.path.exists(self.fn):
                 raise BedToolsFileError("{0} does not exist".format(self.fn))
-            if isGZIP(self.fn):
-                return IntervalIterator(gzip.open(self.fn, "rt"))
-            else:
-                return IntervalIterator(open(self.fn, "r"))
+            return IntervalIterator(open_interval_file(self.fn, preload=preload))
         # Any other kind of input (streaming string from stdout; iterable of
         # Intervals, iterable of (chrom, start, stop) tuples, etc are handled
         # appropriately by IntervalIterator.
@@ -1315,13 +1321,7 @@ class BedTool(object):
         if self._isbam:
             raise NotImplementedError("head() not supported for BAM")
         else:
-            if isGZIP(self.fn):
-                openfunc = gzip.open
-                openmode = "rt"
-            else:
-                openfunc = open
-                openmode = "r"
-            with openfunc(self.fn, openmode) as fin:
+            with open_interval_file(self.fn) as fin:
                 for i, line in enumerate(fin):
                     if i == (n):
                         break
@@ -1384,15 +1384,11 @@ class BedTool(object):
             will be added.
 
         in_compressed : bool
-            Indicates whether the input is compressed
+            Ignored; a gzip input file is detected from its contents.
 
         out_compressed : bool
             Indicates whether the output should be compressed
         """
-        if fn is None:
-            fn = self._tmp()
-
-        in_open_func = gzip.open if in_compressed else open
         out_open_func = gzip.open if out_compressed else open
 
         # special case: if BAM-format BedTool is provided, no trackline should
@@ -1403,23 +1399,26 @@ class BedTool(object):
                     "trackline provided, but input is a BAM "
                     "file, which takes no track line"
                 )
+            if fn is None:
+                fn = self._tmp()
             with open(fn, "wb") as out_:
                 out_.write(open(self.fn, "rb").read())
             return fn
 
         # If we're just working with filename-based BedTool objects, just copy
-        # the files directly
+        # the files directly. A gzip input is fully read (within the
+        # settings.gzip_max_*_bytes ceilings) before the output is created.
         if isinstance(iterable, BedTool) and isinstance(iterable.fn, str):
-            with out_open_func(fn, "wt") as out_:
-                if sys.version_info > (3,0):
-                    in_ = in_open_func(iterable.fn, "rt", errors="ignore")
-                else:
-                    in_ = in_open_func(iterable.fn, "rt")
-                if trackline:
-                    out_.write(trackline.strip() + "\n")
-                out_.writelines(in_)
-                in_.close()
+            with open_interval_file(iterable.fn, errors="ignore", preload=True) as in_:
+                if fn is None:
+                    fn = self._tmp()
+                with out_open_func(fn, "wt") as out_:
+                    if trackline:
+                        out_.write(trackline.strip() + "\n")
+                    out_.writelines(in_)
         else:
+            if fn is None:
+                fn = self._tmp()
             with out_open_func(fn, "wt") as out_:
                 for i in iterable:
                     if isinstance(i, (list, tuple)):
@@ -3307,14 +3306,19 @@ class BedTool(object):
                     "BedTool?  If so, use .saveas() to save to file first"
                 )
 
+        # gzip inputs are fully read (within the settings.gzip_max_*_bytes
+        # ceilings) before the output tempfile is created.
+        sources = [
+            iter(bt) if bt._isbam else bt._iter_intervals(preload=True)
+            for bt in [self] + other_beds
+        ]
+
         tmp = self._tmp()
 
         if not force_truncate and same_type and same_field_num:
             with open(tmp, "w") as TMP:
-                for f in self:
-                    TMP.write(str(f))
-                for other in other_beds:
-                    for f in other:
+                for source in sources:
+                    for f in source:
                         TMP.write(str(f))
 
         # Types match, so we can use the min number of fields observed across
@@ -3322,20 +3326,16 @@ class BedTool(object):
         elif not force_truncate and same_type:
             minfields = min(field_nums)
             with open(tmp, "w") as TMP:
-                for f in self:
-                    TMP.write("\t".join(f.fields[:minfields]) + "\n")
-                for other in other_beds:
-                    for f in other:
+                for source in sources:
+                    for f in source:
                         TMP.write("\t".join(f.fields[:minfields]) + "\n")
 
         # Otherwise, use the zero-based chrom/start/stop to create a BED3,
         # which will work when catting a GFF and a BED together.
         else:
             with open(tmp, "w") as TMP:
-                for f in self:
-                    TMP.write("%s\t%i\t%i\n" % (f.chrom, f.start, f.end))
-                for other in other_beds:
-                    for f in other:
+                for source in sources:
+                    for f in source:
                         TMP.write("%s\t%i\t%i\n" % (f.chrom, f.start, f.end))
 
         c = BedTool(tmp)
@@ -3380,24 +3380,15 @@ class BedTool(object):
         >>> if os.path.exists('other.bed'):
         ...     os.unlink('other.bed')
         """
-        if fn is None:
-            fn = self._tmp()
-
         # Default to compressed if extension is .gz
         if compressed is None:
-            __, extension = os.path.splitext(fn)
-            if extension == ".gz":
-                compressed = True
-            else:
-                compressed = False
-
-        in_compressed = isinstance(self.fn, str) and isGZIP(self.fn)
+            target = fn if fn is not None else "tmp" + settings.tempfile_suffix
+            compressed = os.path.splitext(target)[1] == ".gz"
 
         fn = self._collapse(
             self,
             fn=fn,
             trackline=trackline,
-            in_compressed=in_compressed,
             out_compressed=compressed,
         )
         return BedTool(fn)
@@ -3764,7 +3755,12 @@ class BedTool(object):
             kwargs["names"] = _names
 
         if os.path.isfile(self.fn) and os.path.getsize(self.fn) > 0:
-            return pandas.read_csv(self.fn, *args, sep="\t", **kwargs) # type: ignore
+            handle = open_interval_file(self.fn)
+            # A chunked reader keeps reading from the handle after returning.
+            if kwargs.get("iterator") or kwargs.get("chunksize"):
+                return pandas.read_csv(handle, *args, sep="\t", **kwargs) # type: ignore
+            with handle:
+                return pandas.read_csv(handle, *args, sep="\t", **kwargs) # type: ignore
         else:
             return pandas.DataFrame()
 

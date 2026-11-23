@@ -10,6 +10,9 @@ aaronquinlan@gmail.com
 Licensed under the MIT license (as of Jan 2022)
 ******************************************************************************/
 #include "bedFile.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 /*******************************************
 Class methods
@@ -19,7 +22,12 @@ Class methods
 BedFile::BedFile(string bedFile)
 : bedFile(bedFile),
 _typeIsKnown(false),
-_lineNum(0)
+_bedStream(NULL),
+_gzStream(NULL),
+_lineNum(0),
+_gzMaxCompressed(-1),
+_gzMaxDecompressed(-1),
+_gzMaxLine(-1)
 {}
 
 // Destructor
@@ -27,7 +35,59 @@ BedFile::~BedFile(void) {
 }
 
 
+void BedFile::setGzipLimits(long long maxCompressed, long long maxDecompressed, long long maxLine) {
+    _gzMaxCompressed = maxCompressed;
+    _gzMaxDecompressed = maxDecompressed;
+    _gzMaxLine = maxLine;
+}
+
+
+void BedFile::setLimitError(const char *what, long long limit) {
+    ostringstream msg;
+    msg << "gzip interval file " << bedFile << " exceeds the " << what
+        << " size limit of " << limit << " bytes (pybedtools.settings.gzip_max_"
+        << what << "_bytes)";
+    limitError = msg.str();
+}
+
+
+// Opens the file once and applies the compressed-size ceiling to that same
+// descriptor, so the checked file is the one that gets decompressed.
+int BedFile::OpenGzip(void) {
+    int fd = ::open(bedFile.c_str(), O_RDONLY);
+    if (fd < 0) {
+        cerr << "BEDTools Error: The requested bed file (" << bedFile << ") could not be opened. Exiting!" << endl;
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        cerr << "BEDTools Error: Unexpected file type (" << bedFile << "). Exiting!" << endl;
+        return -1;
+    }
+    if (_gzMaxCompressed >= 0 && (long long) st.st_size > _gzMaxCompressed) {
+        ::close(fd);
+        setLimitError("compressed", _gzMaxCompressed);
+        return -2;
+    }
+    igzstream *gz = new igzstream();
+    gz->rdbuf()->set_limits(_gzMaxCompressed, _gzMaxDecompressed);
+    gz->open_fd(fd);
+    if (!gz->rdbuf()->is_open()) {
+        ::close(fd);
+        delete gz;
+        cerr << "BEDTools Error: The requested bed file (" << bedFile << ") could not be opened. Exiting!" << endl;
+        return -1;
+    }
+    _gzStream = gz;
+    _bedStream = gz;
+    return 1;
+}
+
+
 int BedFile::Open(void) {
+    limitError.clear();
+    _gzStream = NULL;
     if (bedFile == "stdin") {
         _bedStream = &cin;
     }
@@ -49,17 +109,7 @@ int BedFile::Open(void) {
         }
     } 
     else if ((isGzipFile(bedFile) == true) && (isRegularFile(bedFile) == true)) {        
-        igzstream beds(bedFile.c_str(), ios::in);
-        if ( !beds ) {
-            cerr << "BEDTools Error: The requested bed file (" << bedFile << ") could not be opened. Exiting!" << endl;
-            return -1;
-        }
-        else {
-            // if so, close it (this was just a test)
-            beds.close();       
-            // now set a pointer to the stream so that we
-            _bedStream = new igzstream(bedFile.c_str(), ios::in);
-        }
+        return OpenGzip();
     }
     else {
         cerr << "BEDTools Error: Unexpected file type (" << bedFile << "). Exiting!" << endl;
@@ -70,17 +120,55 @@ int BedFile::Open(void) {
 
 // Rewind the pointer back to the beginning of the file
 void BedFile::Rewind(void) {
-    _bedStream->seekg(0, ios::beg);
+    if (_bedStream != NULL) _bedStream->seekg(0, ios::beg);
 }
 
 // Jump to a specific byte in the file
 void BedFile::Seek(unsigned long offset) {
-    _bedStream->seekg(offset);
+    if (_bedStream != NULL) _bedStream->seekg(offset);
 }
 
 // Close the BED file
 void BedFile::Close(void) {
-    if (bedFile != "stdin") delete _bedStream;
+    if (bedFile != "stdin" && _bedStream != NULL) delete _bedStream;
+    _bedStream = NULL;
+    _gzStream = NULL;
+}
+
+
+// Like getline(), but stops with limitError set instead of reading past the
+// gzip ceilings.
+bool BedFile::getGzipLine(string &line) {
+    gzstreambuf *buf = _gzStream->rdbuf();
+    const int eof = char_traits<char>::eof();
+    line.clear();
+    while (true) {
+        int c = buf->sbumpc();
+        if (c == eof) {
+            switch (buf->limit_exceeded()) {
+                case gzstreambuf::GZ_LIMIT_COMPRESSED:
+                    setLimitError("compressed", _gzMaxCompressed);
+                    return false;
+                case gzstreambuf::GZ_LIMIT_DECOMPRESSED:
+                    setLimitError("decompressed", _gzMaxDecompressed);
+                    return false;
+            }
+            _gzStream->setstate(line.empty() ? (ios::eofbit | ios::failbit) : ios::eofbit);
+            return true;
+        }
+        if (c == '\n') {
+            if (_gzMaxLine >= 0 && (long long) line.size() + 1 > _gzMaxLine) {
+                setLimitError("line", _gzMaxLine);
+                return false;
+            }
+            return true;
+        }
+        line.push_back((char) c);
+        if (_gzMaxLine >= 0 && (long long) line.size() > _gzMaxLine) {
+            setLimitError("line", _gzMaxLine);
+            return false;
+        }
+    }
 }
 
 
@@ -90,13 +178,21 @@ BED BedFile::GetNextBed() {
     
     // make sure there are still lines to process.
     // if so, tokenize, validate and return the BED entry.
-    if (_bedStream->good()) {
+    if (_bedStream != NULL && limitError.empty() && _bedStream->good()) {
         string bedLine;
         vector<string> bedFields;
         bedFields.reserve(12);
 
         // parse the bedStream pointer
-        getline(*_bedStream, bedLine);
+        if (_gzStream != NULL) {
+            if (!getGzipLine(bedLine)) {
+                bed.status = BED_INVALID;
+                return bed;
+            }
+        }
+        else {
+            getline(*_bedStream, bedLine);
+        }
         _lineNum++;
 
         // split into a string vector.
@@ -394,7 +490,7 @@ void BedFile::loadBedFileIntoMap() {
     BED bed, nullBed;
     //BedLineStatus bedStatus;
 
-    Open();
+    if (Open() < 0) return;
     bed = GetNextBed();
     while ( bed.status != BED_INVALID) {
         if (bed.status == BED_VALID) {
@@ -405,4 +501,5 @@ void BedFile::loadBedFileIntoMap() {
         bed = GetNextBed();
     }
     Close();
+    if (!limitError.empty()) bedMap.clear();
 }

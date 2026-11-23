@@ -1,5 +1,6 @@
 import sys
 import os
+import io
 import gzip
 import tempfile
 import subprocess
@@ -165,12 +166,171 @@ class BEDToolsError(Error):
         return m
 
 
+_GZIP_MAGIC = b"\x1f\x8b\x08"
+
+
 def isGZIP(fn):
     with open(fn, "rb") as f:
         start = f.read(3)
-        if start == b"\x1f\x8b\x08":
+        if start == _GZIP_MAGIC:
             return True
     return False
+
+
+def gzip_limits():
+    """
+    Returns the (compressed, decompressed, line) gzip ceilings from
+    pybedtools.settings, each an int >= 0 or None for no ceiling.
+    """
+    limits = (
+        settings.gzip_max_compressed_bytes,
+        settings.gzip_max_decompressed_bytes,
+        settings.gzip_max_line_bytes,
+    )
+    for limit in limits:
+        if limit is not None and (not isinstance(limit, int) or limit < 0):
+            raise ValueError(
+                "pybedtools.settings.gzip_max_*_bytes must be None or an "
+                "int >= 0, got %r" % (limit,)
+            )
+    return limits
+
+
+def _gzip_limit_error(fn, what, limit):
+    return pybedtoolsError(
+        "gzip interval file %s exceeds the %s size limit of %d bytes "
+        "(pybedtools.settings.gzip_max_%s_bytes)" % (fn, what, limit, what)
+    )
+
+
+class _CappedReader(object):
+    """
+    Read-only wrapper around a binary file object that raises once more than
+    *limit* bytes have been read from it.
+    """
+
+    def __init__(self, fileobj, limit, fn):
+        self._fileobj = fileobj
+        self._limit = limit
+        self._fn = fn
+        self._consumed = 0
+
+    def read(self, size=-1):
+        if self._limit is not None:
+            remaining = self._limit + 1 - self._consumed
+            if size is None or size < 0 or size > remaining:
+                size = remaining
+        data = self._fileobj.read(size)
+        self._consumed += len(data)
+        if self._limit is not None and self._consumed > self._limit:
+            raise _gzip_limit_error(self._fn, "compressed", self._limit)
+        return data
+
+
+class _BoundedGzipReader(io.RawIOBase):
+    """
+    Decompresses an already-open gzip file, enforcing the
+    settings.gzip_max_*_bytes ceilings on the compressed size, the total
+    decompressed size, and the length of each line (including its newline).
+    """
+
+    def __init__(self, raw, fn):
+        super().__init__()
+        self._raw = raw
+        self._gz = None
+        self._fn = fn
+        self._error = None
+        self._total = 0
+        self._line = 0
+        max_compressed, self._max_decompressed, self._max_line = gzip_limits()
+        if max_compressed is not None:
+            if os.fstat(raw.fileno()).st_size > max_compressed:
+                raise _gzip_limit_error(fn, "compressed", max_compressed)
+        self._gz = gzip.GzipFile(
+            fileobj=_CappedReader(raw, max_compressed, fn), mode="rb"
+        )
+
+    def readable(self):
+        return True
+
+    def _fail(self, what, limit):
+        self._error = (what, limit)
+        raise _gzip_limit_error(self._fn, what, limit)
+
+    def _check_lines(self, data):
+        last = data.rfind(b"\n")
+        if last < 0:
+            self._line += len(data)
+        elif self._line + len(data) <= self._max_line:
+            self._line = len(data) - last - 1
+            return
+        else:
+            start = 0
+            while True:
+                nl = data.find(b"\n", start)
+                if nl < 0:
+                    self._line += len(data) - start
+                    break
+                if self._line + nl - start + 1 > self._max_line:
+                    self._fail("line", self._max_line)
+                self._line = 0
+                start = nl + 1
+        if self._line > self._max_line:
+            self._fail("line", self._max_line)
+
+    def readinto(self, b):
+        if self._error is not None:
+            raise _gzip_limit_error(self._fn, *self._error)
+        size = len(b)
+        if self._max_decompressed is not None:
+            size = min(size, self._max_decompressed + 1 - self._total)
+        data = self._gz.read(size)
+        n = len(data)
+        self._total += n
+        if self._max_decompressed is not None and self._total > self._max_decompressed:
+            self._fail("decompressed", self._max_decompressed)
+        if self._max_line is not None:
+            self._check_lines(data)
+        b[:n] = data
+        return n
+
+    def close(self):
+        if not self.closed:
+            try:
+                if self._gz is not None:
+                    self._gz.close()
+            finally:
+                self._raw.close()
+        super().close()
+
+
+def open_interval_file(fn, errors=None, preload=False):
+    """
+    Open the local interval file *fn* for reading as text.
+
+    A file that starts with the gzip magic bytes is decompressed, and reading
+    it raises pybedtoolsError once it goes past one of the
+    pybedtools.settings.gzip_max_*_bytes ceilings.
+
+    With *preload*, a gzip file is read completely (within those ceilings)
+    before this function returns, so a file that goes past them fails here
+    instead of part-way through the caller's work. Plain files are never
+    preloaded.
+    """
+    raw = open(fn, "rb")
+    try:
+        if raw.peek(len(_GZIP_MAGIC))[: len(_GZIP_MAGIC)] != _GZIP_MAGIC:
+            return io.TextIOWrapper(raw, errors=errors)
+        handle = io.TextIOWrapper(
+            io.BufferedReader(_BoundedGzipReader(raw, fn)), errors=errors
+        )
+    except BaseException:
+        raw.close()
+        raise
+    if preload and gzip_limits()[1] is not None:
+        with handle:
+            return io.StringIO(handle.read())
+    return handle
 
 
 def isBGZIP(fn):

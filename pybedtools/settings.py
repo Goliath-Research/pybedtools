@@ -15,6 +15,14 @@ bedtools_version = []
 KEEP_TEMPFILES = False
 _DEBUG = True
 
+# Ceilings (inclusive, in bytes) for gzip-compressed interval files that
+# pybedtools reads itself (BedTool iteration, head, saveas, cat, to_dataframe,
+# and IntervalFile). Going past one raises pybedtoolsError. Set a ceiling to
+# None to disable it. Files handed to BEDTools programs are read by bedtools.
+gzip_max_compressed_bytes = 128 * 1024
+gzip_max_decompressed_bytes = 256 * 1024
+gzip_max_line_bytes = 64 * 1024
+
 # Check calls against these names to only allow calls to known BEDTools
 # programs (basic security)
 #

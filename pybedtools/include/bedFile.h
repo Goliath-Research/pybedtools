@@ -290,6 +290,14 @@ public:
     // load a BED file into a map keyed by chrom, then bin. value is vector of BEDs
     void loadBedFileIntoMap();
 
+    // Ceilings (inclusive, in bytes; negative disables) for a gzip file's
+    // compressed size, decompressed size, and line length including the
+    // newline. Going past one stops reading and sets limitError.
+    void setGzipLimits(long long maxCompressed, long long maxDecompressed, long long maxLine);
+
+    // Empty unless the last Open() or read stopped at a gzip ceiling.
+    string limitError;
+
 
     // Given a chrom, start, end and strand for a single feature,
     // search for all overlapping features in another BED file.
@@ -322,10 +330,17 @@ private:
     // data
     FileType   _fileType;     // what is the file type? (BED? GFF? VCF?)    
     istream   *_bedStream;
+    igzstream *_gzStream;     // same object as _bedStream for gzip input, else NULL
     unsigned int _lineNum;
+    long long  _gzMaxCompressed;
+    long long  _gzMaxDecompressed;
+    long long  _gzMaxLine;
 
     void setFileType (FileType type);
     void setBedType (int colNums);
+    int  OpenGzip(void);
+    bool getGzipLine(string &line);
+    void setLimitError(const char *what, long long limit);
     
     /******************************************************
     Private definitions to circumvent linker issues with

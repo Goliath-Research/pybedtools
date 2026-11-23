@@ -791,6 +791,11 @@ cdef class IntervalIterator:
 
 
 
+cdef long long _gzip_limit(value):
+    # The C++ reader uses a negative ceiling to mean "no ceiling".
+    return -1 if value is None else value
+
+
 cdef class IntervalFile:
     cdef BedFile *intervalFile_ptr
     cdef bint _loaded
@@ -804,7 +809,14 @@ cdef class IntervalFile:
 
     """
     def __init__(self, intervalFile):
+        from pybedtools.helpers import gzip_limits
+        max_compressed, max_decompressed, max_line = gzip_limits()
         self.intervalFile_ptr = new BedFile(_cppstr(intervalFile))
+        self.intervalFile_ptr.setGzipLimits(
+            _gzip_limit(max_compressed),
+            _gzip_limit(max_decompressed),
+            _gzip_limit(max_line),
+        )
         self._loaded = 0
         self._open = 0
         self._fn = _cppstr(intervalFile)
@@ -812,12 +824,18 @@ cdef class IntervalFile:
     def __dealloc__(self):
         del self.intervalFile_ptr
 
+    def _raise_if_limited(self):
+        if not self.intervalFile_ptr.limitError.empty():
+            from pybedtools.helpers import pybedtoolsError
+            raise pybedtoolsError(_pystr(self.intervalFile_ptr.limitError))
+
     def __iter__(self):
         return self
 
     def __next__(self):
         if not self._open:
             result = self.intervalFile_ptr.Open()
+            self._raise_if_limited()
             if result == -1:
                 raise BedToolsFileError("Error opening file")
             self._open = 1
@@ -826,6 +844,7 @@ cdef class IntervalFile:
             return create_interval(b)
         elif b.status == BED_INVALID:
             self.intervalFile_ptr.Close()
+            self._raise_if_limited()
             raise StopIteration
         elif b.status == BED_MALFORMED:
             self.intervalFile_ptr.Close()
@@ -864,6 +883,7 @@ cdef class IntervalFile:
         if self._loaded:
             return
         self.intervalFile_ptr.loadBedFileIntoMap()
+        self._raise_if_limited()
         self._loaded = 1
 
     def rewind(self):
@@ -872,6 +892,7 @@ cdef class IntervalFile:
         """
         if not self._open:
             self.intervalFile_ptr.Open()
+            self._raise_if_limited()
             self._open = 1
         self.intervalFile_ptr.Rewind()
 
@@ -881,6 +902,7 @@ cdef class IntervalFile:
         """
         if not self._open:
             self.intervalFile_ptr.Open()
+            self._raise_if_limited()
             self._open = 1
         self.intervalFile_ptr.Seek(offset)
 
