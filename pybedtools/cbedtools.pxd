@@ -61,6 +61,8 @@ cdef extern from "bedFile.h":
         void Close()
         BED  GetNextBed()
         void loadBedFileIntoMap()
+        void setGzipLimits(long long maxCompressed, long long maxDecompressed, long long maxLine)
+        string limitError
 
         ### "all" ###
         # this version doesn't care if the strands match.
