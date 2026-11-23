@@ -26,6 +26,37 @@ venn.diagram(
 )
 
 
+_R_NAMED_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _R_string(value):
+    """
+    Return `str(value)` as a double-quoted R string literal.
+
+    Every character other than printable ASCII is escaped, so the value can
+    never end the literal early and the result is plain ASCII regardless of
+    the locale R reads the script in.
+    """
+    out = []
+    for ch in str(value):
+        if ch in _R_NAMED_ESCAPES:
+            out.append(_R_NAMED_ESCAPES[ch])
+        elif " " <= ch <= "~":
+            out.append(ch)
+        elif ch == "\0":
+            raise ValueError("R strings cannot contain NUL characters: %r" % value)
+        else:
+            # R refuses to mix \x and \U escapes in one string, so use \U only.
+            out.append("\\U{%x}" % ord(ch))
+    return '"%s"' % "".join(out)
+
+
 def _list_to_R_syntax(x):
     """
     Convert items in `x` to a string, and replace tabs with pipes in Interval
@@ -36,7 +67,7 @@ def _list_to_R_syntax(x):
     for i in x:
         if isinstance(i, pybedtools.Interval):
             i = str(i).replace("\t", "|")
-        items.append('"%s"' % i)
+        items.append(_R_string(i))
     return "c(%s)" % ",".join(items)
 
 
@@ -46,7 +77,7 @@ def _dict_to_R_named_list(d):
     """
     items = []
     for key, val in list(d.items()):
-        items.append('"%s" = %s' % (key, _list_to_R_syntax(val)))
+        items.append("%s = %s" % (_R_string(key), _list_to_R_syntax(val)))
     return "list(%s)" % ", ".join(items)
 
 
@@ -199,7 +230,7 @@ def venn_maker(
     if figure_filename is None:
         figure_filename = "NULL"
     else:
-        figure_filename = '"%s"' % figure_filename
+        figure_filename = _R_string(figure_filename)
 
     if names is None:
         names = "abcd"[: len(beds)]
