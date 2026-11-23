@@ -1,6 +1,7 @@
 from __future__ import annotations
 import tempfile
 from textwrap import dedent
+import shlex
 import shutil
 import subprocess
 import operator
@@ -3568,17 +3569,33 @@ class BedTool(object):
         ones as `unmapped`.  If `unmapped` is None, then discards the unmapped
         features.
 
-        `liftover_args` is a string of additional args that is passed,
-        verbatim, to liftOver.
+        `liftover_args` is a string of additional args that is split into
+        separate arguments with shell-like quoting rules and passed to
+        liftOver. It is never interpreted by a shell.
 
         Needs `liftOver` from UCSC to be on the path and a `chainfile`
         downloaded from UCSC.
         """
+
+        def _path_arg(path) -> str:
+            # liftOver treats any argument starting with "-" as an option.
+            path = os.fspath(path)
+            if path.startswith("-"):
+                path = os.path.join(os.curdir, path)
+            return path
+
         result = BedTool._tmp()
         if unmapped is None:
             unmapped = BedTool._tmp()
-        cmds = ["liftOver", liftover_args, self.fn, chainfile, result, unmapped]
-        os.system(" ".join(cmds))
+        cmds = [
+            "liftOver",
+            *shlex.split(liftover_args),
+            _path_arg(self.fn),
+            _path_arg(chainfile),
+            _path_arg(result),
+            _path_arg(unmapped),
+        ]
+        subprocess.run(cmds, check=True)
         return BedTool(result)
 
     def absolute_distance(self, other: BedTool, closest_kwargs: Optional[dict[str, Any]]=None, use_midpoints: bool=False) -> Iterator[int]:
